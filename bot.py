@@ -150,7 +150,10 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success_a:
         try:
             rms_a = api_a.rmsLimit()
-            margin_a = rms_a['data']['net']
+            margin_a = "N/A"
+            if isinstance(rms_a, dict) and rms_a.get('data'):
+                data_a = rms_a['data']
+                margin_a = data_a.get('net', data_a.get('availablecash', 'Connected'))
             status_msg += f"🟢 **Phone A (R372797) Margin:** ₹{margin_a}\n"
         except Exception as e:
             status_msg += f"🟡 **Phone A (R372797):** Connected (Margin Error: {e})\n"
@@ -163,7 +166,10 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if success_b:
         try:
             rms_b = api_b.rmsLimit()
-            margin_b = rms_b['data']['net']
+            margin_b = "N/A"
+            if isinstance(rms_b, dict) and rms_b.get('data'):
+                data_b = rms_b['data']
+                margin_b = data_b.get('net', data_b.get('availablecash', 'Connected'))
             status_msg += f"🟢 **Phone B (AACK748195) Margin:** ₹{margin_b}\n"
         except Exception as e:
             status_msg += f"🟡 **Phone B (AACK748195):** Connected (Margin Error: {e})\n"
