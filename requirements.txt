@@ -1,3 +1,5 @@
-smartapi-python
-python-telegram-bot
 telethon
+python-telegram-bot
+smartapi-python
+asyncio
+requests
