@@ -6,3 +6,7 @@ websocket-client
 pyjwt
 requests
 asyncio
+pyotp
+urllib3
+six
+certifi
