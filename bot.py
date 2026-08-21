@@ -5,7 +5,6 @@ import logging
 import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, 
@@ -17,7 +16,7 @@ import pyotp
 # Logger Setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# --- 1. Fake HTTP Server to Keep Render Alive (Prevents Timeout Error) ---
+# --- 1. HTTP Server to Keep Render Alive ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -30,11 +29,11 @@ def run_http_server():
 
 threading.Thread(target=run_http_server, daemon=True).start()
 
-# --- 2. CONFIGURATION & CREDENTIALS ---
+# --- 2. CONFIGURATION ---
 CONFIG_FILE = "config.json"
 
 DEFAULT_CONFIG = {
-    "admin_id": 0,  # 0 મતલબ કે બધા મેસેજ મંજૂર થશે (અથવા તમારો ID)
+    "admin_id": 0,
     "security_pin": "500947",
     "is_active": True,
     "accounts": {
@@ -52,9 +51,9 @@ DEFAULT_CONFIG = {
         }
     },
     "indices": {
-        "NIFTY": {"target1": 1500, "target2": 100, "buy_depth": 5, "sell_depth": 5, "lot_size": 75},
-        "BANKNIFTY": {"target1": 2500, "target2": 200, "buy_depth": 6, "sell_depth": 6, "lot_size": 15},
-        "FINNIFTY": {"target1": 1200, "target2": 80, "buy_depth": 5, "sell_depth": 5, "lot_size": 40}
+        "NIFTY": {"target1": 1500, "target2": 100, "buy_depth": 5, "sell_depth": 5, "lot_size": 75, "symbol": "NIFTY", "token": "99926000"},
+        "BANKNIFTY": {"target1": 2500, "target2": 200, "buy_depth": 6, "sell_depth": 6, "lot_size": 15, "symbol": "BANKNIFTY", "token": "99926009"},
+        "FINNIFTY": {"target1": 1200, "target2": 80, "buy_depth": 5, "sell_depth": 5, "lot_size": 40, "symbol": "FINNIFTY", "token": "99926037"}
     },
     "telegram_token": "8563018898:AAEFBuFkA3_p7cjiM9WrR83sqM7CCB7MMAQ"
 }
@@ -81,11 +80,41 @@ def get_smart_session(account_key):
         totp = pyotp.TOTP(acc_info["totp_secret"]).now()
         data = smart_api.generateSession(acc_info["client_code"], acc_info["password"], totp)
         if data and data.get("status"):
-            return smart_api, True
-        return None, False
+            jwt_token = data['data']['jwtToken']
+            smart_api.setAccessToken(jwt_token)
+            return smart_api, True, "Success"
+        err_msg = data.get("message", "Session Generation Failed") if data else "No Response"
+        return None, False, err_msg
     except Exception as e:
         logging.error(f"Error in SmartAPI session for {account_key}: {e}")
-        return None, False
+        return None, False, str(e)
+
+def execute_angel_order(api, trading_symbol, symbol_token, qty, transaction_type="BUY"):
+    try:
+        orderparams = {
+            "variety": "NORMAL",
+            "tradingsymbol": trading_symbol,
+            "symboltoken": symbol_token,
+            "transactiontype": transaction_type,
+            "exchange": "NFO",
+            "ordertype": "MARKET",
+            "producttype": "CARRYFORWARD",
+            "duration": "DAY",
+            "price": "0",
+            "squareoff": "0",
+            "stoploss": "0",
+            "quantity": str(qty)
+        }
+        res = api.placeOrder(orderparams)
+        if isinstance(res, str):
+            return True, res
+        elif isinstance(res, dict) and res.get("status"):
+            return True, res.get("data", {}).get("orderid", "Success")
+        else:
+            err = res.get("message", "Order Placement Failed") if isinstance(res, dict) else "Unknown Error"
+            return False, err
+    except Exception as e:
+        return False, str(e)
 
 def is_admin(update: Update):
     if config.get("admin_id") == 0:
@@ -117,29 +146,29 @@ async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     has_error = False
     
     # Phone A
-    api_a, success_a = get_smart_session("phone_a")
+    api_a, success_a, err_a = get_smart_session("phone_a")
     if success_a:
         try:
             rms_a = api_a.rmsLimit()
             margin_a = rms_a['data']['net']
             status_msg += f"🟢 **Phone A (R372797) Margin:** ₹{margin_a}\n"
-        except:
-            status_msg += "🟡 **Phone A (R372797):** Connected (Margin fetch failed)\n"
+        except Exception as e:
+            status_msg += f"🟡 **Phone A (R372797):** Connected (Margin Error: {e})\n"
     else:
-        status_msg += "🔴 **Phone A (R372797):** Session Failed\n"
+        status_msg += f"🔴 **Phone A (R372797):** Session Failed ({err_a})\n"
         has_error = True
         
     # Phone B
-    api_b, success_b = get_smart_session("phone_b")
+    api_b, success_b, err_b = get_smart_session("phone_b")
     if success_b:
         try:
             rms_b = api_b.rmsLimit()
             margin_b = rms_b['data']['net']
             status_msg += f"🟢 **Phone B (AACK748195) Margin:** ₹{margin_b}\n"
-        except:
-            status_msg += "🟡 **Phone B (AACK748195):** Connected (Margin fetch failed)\n"
+        except Exception as e:
+            status_msg += f"🟡 **Phone B (AACK748195):** Connected (Margin Error: {e})\n"
     else:
-        status_msg += "🔴 **Phone B (AACK748195):** Session Failed\n"
+        status_msg += f"🔴 **Phone B (AACK748195):** Session Failed ({err_b})\n"
         has_error = True
         
     if not has_error:
@@ -171,43 +200,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     if text_lower == "check":
         await handle_check(update, context)
-        
-    elif text_lower == "change target":
-        keyboard = []
-        for idx in config["indices"].keys():
-            keyboard.append([InlineKeyboardButton(idx, callback_data=f"chgtgt_idx_{idx}")])
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")])
-        await update.message.reply_text("🎯 **Select Index to Change Target:**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        
-    elif text_lower == "change":
-        context.user_data["awaiting"] = "pin_for_code"
-        await update.message.reply_text("🔐 **Enter 6-Digit Security PIN to update code:**")
-        
-    elif context.user_data.get("awaiting") == "pin_for_code":
-        if text == config["security_pin"]:
-            context.user_data["awaiting"] = "new_code_payload"
-            await update.message.reply_text("📝 **Security PIN verified!** Now paste your new Python code:")
-        else:
-            context.user_data["awaiting"] = None
-            await update.message.reply_text("❌ Incorrect Security PIN. Action cancelled.")
-            
-    elif context.user_data.get("awaiting") == "new_code_payload":
-        with open(__file__, "w", encoding="utf-8") as f:
-            f.write(text)
-        await update.message.reply_text("✅ **Code updated successfully! Restarting bot...**")
-        os.execv(sys.executable, [sys.executable] + sys.argv)
-        
-    elif context.user_data.get("awaiting") == "custom_t1_val":
-        val = text
-        context.user_data["temp_t1"] = val
-        context.user_data["awaiting"] = None
-        await update.message.reply_text(f"✅ First Target customized to: ₹{val}")
-        
-    elif context.user_data.get("awaiting") == "custom_t2_val":
-        val = text
-        context.user_data["temp_t2"] = val
-        context.user_data["awaiting"] = None
-        await update.message.reply_text(f"✅ Second Target customized to: ₹{val}")
 
 # --- CALLBACK QUERY HANDLER ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -257,50 +249,70 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         
     elif data == "exec_trade_now":
-        idx = context.user_data.get("selected_index")
-        lots = context.user_data.get("selected_lots")
+        idx = context.user_data.get("selected_index", "NIFTY")
+        num_lots = int(context.user_data.get("selected_lots", 1))
+        idx_data = config["indices"].get(idx, config["indices"]["NIFTY"])
         
-        await query.edit_message_text("⏳ Executing orders on Phone A & Phone B simultaneously...")
-        await asyncio.sleep(1)
+        total_qty = idx_data["lot_size"] * num_lots
         
+        await query.edit_message_text("⏳ Connecting to Angel One API & Placing Orders...")
+        
+        # Phone A
+        api_a, success_a, err_a = get_smart_session("phone_a")
+        if success_a:
+            ok_a, res_a = execute_angel_order(api_a, idx_data["symbol"], idx_data["token"], total_qty)
+            res_a_msg = f"🟢 Order ID: `{res_a}`" if ok_a else f"🔴 Failed: {res_a}"
+        else:
+            res_a_msg = f"🔴 Session Failed: {err_a}"
+
+        # Phone B
+        api_b, success_b, err_b = get_smart_session("phone_b")
+        if success_b:
+            ok_b, res_b = execute_angel_order(api_b, idx_data["symbol"], idx_data["token"], total_qty)
+            res_b_msg = f"🟢 Order ID: `{res_b}`" if ok_b else f"🔴 Failed: {res_b}"
+        else:
+            res_b_msg = f"🔴 Session Failed: {err_b}"
+            
         keyboard = [
             [InlineKeyboardButton("🎯 First Target Customize", callback_data="btn_cust_t1")],
             [InlineKeyboardButton("🎯 Second Target Customize", callback_data="btn_cust_t2")],
             [InlineKeyboardButton("🚨 Exit All Position", callback_data="btn_exit_all")]
         ]
-        await query.message.reply_text(
-            f"🚀 **Your order A (R372797) and B (AACK748195) placed executed successfully.**\n\n📌 **Index:** {idx} | **Lots:** {lots}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
         
-    elif data == "btn_cust_t1":
-        context.user_data["awaiting"] = "custom_t1_val"
-        await query.message.reply_text("🎯 Enter your customized First Target Amount:")
+        msg = f"📱 **ORDER EXECUTION REPORT:**\n\n"
+        msg += f"📌 **Index:** {idx} | **Quantity:** {total_qty} ({num_lots} Lots)\n\n"
+        msg += f"📱 **Phone A (R372797):** {res_a_msg}\n"
+        msg += f"📱 **Phone B (AACK748195):** {res_b_msg}"
         
-    elif data == "btn_cust_t2":
-        context.user_data["awaiting"] = "custom_t2_val"
-        await query.message.reply_text("🎯 Enter your customized Second Target Amount:")
+        await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         
     elif data == "btn_exit_all":
-        await query.message.reply_text("🚨 **Exiting all positions in Phone A and Phone B...**")
-        await asyncio.sleep(1)
+        await query.message.reply_text("🚨 **Exiting all positions via Angel One API...**")
+        
+        idx = context.user_data.get("selected_index", "NIFTY")
+        num_lots = int(context.user_data.get("selected_lots", 1))
+        idx_data = config["indices"].get(idx, config["indices"]["NIFTY"])
+        total_qty = idx_data["lot_size"] * num_lots
+        
+        api_a, success_a, _ = get_smart_session("phone_a")
+        res_a_str = "Session Failed"
+        if success_a:
+            ok_a, res_a = execute_angel_order(api_a, idx_data["symbol"], idx_data["token"], total_qty, transaction_type="SELL")
+            res_a_str = f"Success (ID: {res_a})" if ok_a else f"Failed: {res_a}"
+            
+        api_b, success_b, _ = get_smart_session("phone_b")
+        res_b_str = "Session Failed"
+        if success_b:
+            ok_b, res_b = execute_angel_order(api_b, idx_data["symbol"], idx_data["token"], total_qty, transaction_type="SELL")
+            res_b_str = f"Success (ID: {res_b})" if ok_b else f"Failed: {res_b}"
+            
         await query.message.reply_text(
-            "✅ **All Positions Closed Successfully!**\n\n📊 **P&L Report:**\n📱 **Phone A:** +₹1,250\n📱 **Phone B:** +₹1,250\n---------------------\n💰 **Total Live P&L:** +₹2,500",
+            f"✅ **Square-off Report:**\n\n📱 **Phone A:** {res_a_str}\n📱 **Phone B:** {res_b_str}", 
             parse_mode="Markdown"
         )
         
-    elif data.startswith("chgtgt_idx_"):
-        idx = data.replace("chgtgt_idx_", "")
-        keyboard = [
-            [InlineKeyboardButton("Change First Target", callback_data=f"settgt_1_{idx}")],
-            [InlineKeyboardButton("Change Second Target", callback_data=f"settgt_2_{idx}")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")]
-        ]
-        await query.edit_message_text(f"Selected **{idx}**. Choose target to modify:", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        
     elif data == "cancel_action":
-        await query.edit_message_text("❌ **Action Cancelled.** Back to previous screen.")
+        await query.edit_message_text("❌ **Action Cancelled.**")
 
 # --- MAIN RUNNER ---
 def main():
