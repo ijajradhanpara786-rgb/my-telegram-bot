@@ -5,8 +5,10 @@ import os
 import http.server
 import socketserver
 import threading
+import time
 from datetime import datetime
 import pyotp
+import requests
 from SmartApi import SmartConnect
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -15,7 +17,7 @@ from telegram.ext import (
 )
 
 # -------------------------------------------------------------
-# 1. DUMMY HTTP SERVER (For Render/Koyeb 24/7 Hosting)
+# 1. DUMMY HTTP SERVER (For 24/7 Hosting)
 # -------------------------------------------------------------
 def run_http_server():
     port = int(os.environ.get("PORT", 8080))
@@ -26,12 +28,9 @@ def run_http_server():
 threading.Thread(target=run_http_server, daemon=True).start()
 
 # -------------------------------------------------------------
-# 2. CREDENTIALS & SECURITY CONFIGURATION
+# 2. CREDENTIALS & CONFIGURATION
 # -------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = "8563018898:AAEFBuFkA3_p7cjiM9WrR83sqM7CCB7MMAQ"
-TELEGRAM_API_ID = 37534041
-TELEGRAM_API_HASH = "32fa9b9aecdff1ad567e236bf677f8ef"
-
 AUTHORIZED_CHAT_ID = "6562604119"
 
 PHONE_A = {
@@ -110,11 +109,31 @@ class TradeHistoryManager:
 history_manager = TradeHistoryManager()
 
 # -------------------------------------------------------------
-# 5. HELPERS
+# 5. DYNAMIC NIFTY FUT EXPIRY & TOKEN FETCHER
 # -------------------------------------------------------------
+def get_nifty_fut_tokens():
+    try:
+        url = "https://margincalculator.angelbroking.com/OpenAPI_Standard_OpenAPI_MasterData/OpenAPIScripMaster.json"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        nifty_futs = [
+            item for item in data 
+            if item.get('name') == 'NIFTY' and item.get('instrumenttype') == 'FUTIDX' and item.get('exch_seg') == 'NFO'
+        ]
+        
+        nifty_futs.sort(key=lambda x: datetime.strptime(x['expiry'], '%d%b%Y'))
+        
+        current_month_fut = nifty_futs[0]
+        next_month_fut = nifty_futs[1]
+        
+        return current_month_fut, next_month_fut
+    except Exception as e:
+        logging.error(f"Error fetching master tokens: {e}")
+        return None, None
+
 def is_authorized(update: Update):
-    user_id = str(update.effective_user.id)
-    return user_id == str(AUTHORIZED_CHAT_ID)
+    return str(update.effective_user.id) == str(AUTHORIZED_CHAT_ID)
 
 def reset_trade_specific_flags():
     global manual_mode_t1, manual_mode_t2
@@ -122,7 +141,7 @@ def reset_trade_specific_flags():
     manual_mode_t2 = False
 
 # -------------------------------------------------------------
-# 6. ANGEL ONE API, BASKET & DUAL MARKET DEPTH LOGIC
+# 6. ANGEL ONE LOGIN, PNL & BASKET EXECUTION
 # -------------------------------------------------------------
 def login_angel_one(acc_details):
     try:
@@ -147,130 +166,163 @@ def get_account_pnl(smart_obj):
         logging.error(f"Error fetching PnL: {str(e)}")
         return 0.0
 
-async def execute_named_basket(smart_obj, basket_name="Nifty"):
-    """Nifty नाम की Basket Execute करना"""
+async def execute_hedged_nifty_basket(smart_obj, account_type):
     if not smart_obj: return False, "Session Inactive"
     try:
-        # Angel One Basket Trigger API Call
-        return True, f"Basket '{basket_name}' Executed Successfully"
-    except Exception as e:
-        return False, f"Basket Execution Error: {str(e)}"
+        curr_fut, next_fut = get_nifty_fut_tokens()
+        if not curr_fut or not next_fut:
+            return False, "Failed to fetch Future Tokens"
 
-def check_dual_market_depth_and_exit(smart_obj, account_name):
-    """
-    BUY Leg Exit -> Sell Depth Check (Diff <= ₹5)
-    SELL Leg Exit -> Buy Depth Check (Diff <= ₹5)
-    0 से 5 रु के अंतर होने पर ही Exit
-    """
-    if not smart_obj: return False, "API Session Inactive"
+        lot_size = str(curr_fut.get('lotsize', '65'))
+
+        if account_type == "Phone_A":
+            basket_orders = [
+                {
+                    "variety": "NORMAL", "tradingsymbol": curr_fut['symbol'], "symboltoken": curr_fut['token'],
+                    "transactiontype": "BUY", "exchange": "NFO", "ordertype": "MARKET",
+                    "producttype": "CARRYFORWARD", "duration": "DAY", "price": "0", "quantity": lot_size
+                },
+                {
+                    "variety": "NORMAL", "tradingsymbol": next_fut['symbol'], "symboltoken": next_fut['token'],
+                    "transactiontype": "SELL", "exchange": "NFO", "ordertype": "MARKET",
+                    "producttype": "CARRYFORWARD", "duration": "DAY", "price": "0", "quantity": lot_size
+                }
+            ]
+
+        elif account_type == "Phone_B":
+            basket_orders = [
+                {
+                    "variety": "NORMAL", "tradingsymbol": next_fut['symbol'], "symboltoken": next_fut['token'],
+                    "transactiontype": "BUY", "exchange": "NFO", "ordertype": "MARKET",
+                    "producttype": "CARRYFORWARD", "duration": "DAY", "price": "0", "quantity": lot_size
+                },
+                {
+                    "variety": "NORMAL", "tradingsymbol": curr_fut['symbol'], "symboltoken": curr_fut['token'],
+                    "transactiontype": "SELL", "exchange": "NFO", "ordertype": "MARKET",
+                    "producttype": "CARRYFORWARD", "duration": "DAY", "price": "0", "quantity": lot_size
+                }
+            ]
+
+        response = smart_obj.placeBasketOrder(basket_orders)
+        if response and response.get('status'):
+            return True, f"Basket Executed for {account_type}"
+        else:
+            for order in basket_orders:
+                smart_obj.placeOrder(order)
+            return True, f"Sequential Orders Placed for {account_type}"
+
+    except Exception as e:
+        return False, f"Execution Failed: {str(e)}"
+
+# -------------------------------------------------------------
+# 7. NON-BLOCKING CUSTOM SAFE EXIT LOGIC
+# -------------------------------------------------------------
+async def smart_limit_exit_all(smart_obj, account_name):
+    if not smart_obj: return False, "Session Inactive"
     try:
         pos_res = smart_obj.position()
         if not pos_res or not pos_res.get('data'):
-            return True, "No open position to exit."
+            return True, f"All Positions Closed for {account_name} ✅"
 
-        for pos in pos_res['data']:
+        open_positions = [p for p in pos_res['data'] if int(p.get('netqty', 0)) != 0]
+        if not open_positions:
+            return True, f"All Positions Closed for {account_name} ✅"
+
+        for pos in open_positions:
             net_qty = int(pos.get('netqty', 0))
-            if net_qty != 0:
-                token = pos.get('symboltoken')
-                exchange = pos.get('exchange', 'NFO')
-                ltp = float(pos.get('ltp', 0))
-                
-                market_data = smart_obj.getMarketData("FULL", {exchange: [token]})
-                if market_data and market_data.get('status'):
-                    depth = market_data['data']['fetched'][0].get('depth', {})
-                    buy_depth_list = depth.get('buy', [{}])
-                    sell_depth_list = depth.get('sell', [{}])
+            token = pos.get('symboltoken')
+            exchange = pos.get('exchange', 'NFO')
+            symbol = pos.get('tradingsymbol')
+            product = pos.get('producttype')
+            ltp = float(pos.get('ltp', 0))
 
-                    best_buy_price = float(buy_depth_list[0].get('price', 0)) if buy_depth_list else ltp
-                    best_sell_price = float(sell_depth_list[0].get('price', 0)) if sell_depth_list else ltp
+            best_price = ltp
+            market_data = smart_obj.getMarketData("FULL", {exchange: [token]})
+            
+            if market_data and market_data.get('status') and market_data.get('data'):
+                fetched_item = market_data['data']['fetched'][0]
+                depth = fetched_item.get('depth', {})
+                fetched_ltp = float(fetched_item.get('ltp', ltp))
+                if fetched_ltp > 0:
+                    ltp = fetched_ltp
 
-                    # BUY position exit -> check Sell Market Depth (Max ₹5 diff)
-                    if net_qty > 0:
-                        diff = abs(best_sell_price - ltp)
-                        if diff > 5.0:
-                            return False, f"Waiting: BUY leg sell-depth gap ₹{diff:.2f} > ₹5"
+                if net_qty > 0:
+                    buy_list = depth.get('buy', [{}])
+                    if buy_list and buy_list[0].get('price'):
+                        best_price = float(buy_list[0].get('price'))
+                else:
+                    sell_list = depth.get('sell', [{}])
+                    if sell_list and sell_list[0].get('price'):
+                        best_price = float(sell_list[0].get('price'))
 
-                    # SELL position exit -> check Buy Market Depth (Max ₹5 diff)
-                    elif net_qty < 0:
-                        diff = abs(ltp - best_buy_price)
-                        if diff > 5.0:
-                            return False, f"Waiting: SELL leg buy-depth gap ₹{diff:.2f} > ₹5"
+            gap = abs(ltp - best_price)
+            
+            if gap > 5.0:
+                logging.info(f"Skipping Exit for {account_name}: Gap Rs.{gap:.2f} > Rs.5.0")
+                return False, f"Gap Rs.{gap:.2f} is wider than Rs.5"
 
-        # अगर अंतर 0 से 5 के अंदर है, तो पूरी बास्केट एग्जिट
-        return real_square_off_all(smart_obj, account_name)
+            tx_type = "SELL" if net_qty > 0 else "BUY"
+
+            order_params = {
+                "variety": "NORMAL",
+                "tradingsymbol": symbol,
+                "symboltoken": token,
+                "transactiontype": tx_type,
+                "exchange": exchange,
+                "ordertype": "LIMIT",
+                "producttype": product,
+                "duration": "DAY",
+                "price": str(best_price),
+                "quantity": str(abs(net_qty))
+            }
+            
+            order_res = smart_obj.placeOrder(order_params)
+            order_id = order_res.get('data', {}).get('orderid') if order_res else None
+
+            await asyncio.sleep(2)
+
+            if order_id:
+                try:
+                    order_book = smart_obj.orderBook()
+                    if order_book and order_book.get('data'):
+                        for ord_item in order_book['data']:
+                            if ord_item.get('orderid') == order_id:
+                                status = ord_item.get('status', '').upper()
+                                if status in ['VALIDATION PENDING', 'OPEN', 'PENDING']:
+                                    smart_obj.cancelOrder(order_id, "NORMAL")
+                                    logging.info(f"Pending order {order_id} cancelled.")
+                                    return False, "Order timed out and was cancelled"
+                except Exception as ex:
+                    logging.error(f"Error checking order: {ex}")
+
+        pos_check = smart_obj.position()
+        if pos_check and pos_check.get('data'):
+            remaining = [p for p in pos_check['data'] if int(p.get('netqty', 0)) != 0]
+            if not remaining:
+                return True, f"All Positions Closed for {account_name} ✅"
+
+        return False, "Positions still open"
 
     except Exception as e:
-        logging.error(f"Depth Check Error: {str(e)}")
-        return False, f"Depth Check Error: {str(e)}"
+        logging.error(f"Custom Exit Error: {str(e)}")
+        return False, f"Exit Error: {str(e)}"
 
-def real_square_off_all(smart_obj, account_name):
-    """खुली हुई पोजीशंस बंद करना"""
-    if not smart_obj: return False, "Session Inactive"
-    try:
-        pos_res = smart_obj.position()
-        if pos_res and pos_res.get('data'):
-            for pos in pos_res['data']:
-                net_qty = int(pos.get('netqty', 0))
-                if net_qty != 0:
-                    tx_type = "SELL" if net_qty > 0 else "BUY"
-                    exit_params = {
-                        "variety": "NORMAL",
-                        "tradingsymbol": pos.get('tradingsymbol'),
-                        "symboltoken": pos.get('symboltoken'),
-                        "transactiontype": tx_type,
-                        "exchange": pos.get('exchange'),
-                        "ordertype": "MARKET",
-                        "producttype": pos.get('producttype'),
-                        "duration": "DAY",
-                        "price": "0",
-                        "quantity": str(abs(net_qty))
-                    }
-                    smart_obj.placeOrder(exit_params)
-            return True, f"All Positions Squared Off for {account_name} ✅"
-        return True, "No open positions found."
-    except Exception as e:
-        return False, f"Square Off Failed: {str(e)}"
-
-# -------------------------------------------------------------
-# 7. SYSTEM HEALTH CHECK
-# -------------------------------------------------------------
-async def perform_system_health_check(update: Update):
-    global smart_a, smart_b
-    await update.message.reply_text("⏳ *Checking System Health & Funds...*", parse_mode="Markdown")
-    
-    issues = []
-    fund_a, fund_b = "N/A", "N/A"
-
-    if not smart_a: issues.append("Phone A: Session Active नहीं है।")
-    else:
+# Helper to send Non-blocking Telegram Messages in background
+def send_telegram_async(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
+    async def _send():
         try:
-            rms_a = smart_a.rmsLimit()
-            if rms_a and rms_a.get('status') and rms_a.get('data'):
-                cash_a = float(rms_a['data'].get('net', 0.0))
-                fund_a = f"₹{cash_a:,.2f}"
-            else: issues.append("Phone A: Fund Read Fail")
-        except Exception as e: issues.append(f"Phone A Error: {str(e)}")
-
-    if not smart_b: issues.append("Phone B: Session Active नहीं है।")
-    else:
-        try:
-            rms_b = smart_b.rmsLimit()
-            if rms_b and rms_b.get('status') and rms_b.get('data'):
-                cash_b = float(rms_b['data'].get('net', 0.0))
-                fund_b = f"₹{cash_b:,.2f}"
-            else: issues.append("Phone B: Fund Read Fail")
-        except Exception as e: issues.append(f"Phone B Error: {str(e)}")
-
-    if not issues:
-        resp = f"✅ *System 100% Ready*\n\n💰 *Funds:*\n• Phone A: {fund_a}\n• Phone B: {fund_b}"
-    else:
-        reasons = "\n".join([f"• {i}" for i in issues])
-        resp = f"⚠️ *System Health Report*\n\n{reasons}\n\n💰 *Funds:*\n• Phone A: {fund_a}\n• Phone B: {fund_b}"
-
-    await update.message.reply_text(resp, parse_mode="Markdown")
+            await context.bot.send_message(
+                chat_id=AUTHORIZED_CHAT_ID,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup
+            )
+        except Exception as e:
+            logging.error(f"Async Telegram Send Error: {e}")
+    asyncio.create_task(_send())
 
 # -------------------------------------------------------------
-# 8. LIVE MONITORING LOOP
+# 8. NON-BLOCKING MONITORING LOOP (0.3s Interval + 30s Anti-Spam)
 # -------------------------------------------------------------
 async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
     global is_monitoring, active_positions, current_target_1, current_target_2
@@ -278,14 +330,26 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
     
     first_target_hit = False
     first_hit_account = None
-    notified_manual_t1 = False
-    notified_manual_t2 = False
+
+    t1_alert_msg_id = None
+    t1_alert_count = 0
+    last_telegram_t1_time = 0
+
+    t2_alert_msg_id = None
+    t2_alert_count = 0
+    last_telegram_t2_time = 0
+
+    is_exiting_t1 = False
+    is_exiting_t2 = False
 
     while is_monitoring:
         try:
-            pnl_a = get_account_pnl(smart_a) if active_positions["Phone_A"] or first_hit_account == "Phone A" else 0.0
-            pnl_b = get_account_pnl(smart_b) if active_positions["Phone_B"] or first_hit_account == "Phone B" else 0.0
+            pnl_a = get_account_pnl(smart_a) if active_positions["Phone_A"] else 0.0
+            pnl_b = get_account_pnl(smart_b) if active_positions["Phone_B"] else 0.0
 
+            # ---------------------------------------------------------
+            # PHASE 1: TARGET 1 MONITORING (Strict Positive Profit >= 1500)
+            # ---------------------------------------------------------
             if not first_target_hit:
                 target_hit_acc = None
                 target_pnl = 0.0
@@ -303,82 +367,152 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
                     smart_target = smart_b
                     acc_key = "Phone_B"
 
-                if target_hit_acc:
-                    if manual_mode_t1:
-                        if not notified_manual_t1:
-                            notified_manual_t1 = True
-                            await context.bot.send_message(
+                if target_hit_acc and not is_exiting_t1:
+                    current_time = time.time()
+                    
+                    if (current_time - last_telegram_t1_time) >= 30 or t1_alert_msg_id is None:
+                        t1_alert_count += 1
+                        last_telegram_t1_time = current_time
+                        
+                        alert_text = (
+                            f"🎯 *TARGET 1 TRIGGERED in {target_hit_acc}!*\n"
+                            f"🔔 *Notification #{t1_alert_count}*\n\n"
+                            f"💰 *Current P&L:* ₹{target_pnl:,.2f}\n"
+                            f"⏳ *Attempting Safe Exit (Gap Limit Rs. 0-5)...*"
+                        )
+
+                        if t1_alert_msg_id:
+                            try:
+                                await context.bot.edit_message_text(
+                                    chat_id=AUTHORIZED_CHAT_ID,
+                                    message_id=t1_alert_msg_id,
+                                    text=alert_text,
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            msg = await context.bot.send_message(
                                 chat_id=AUTHORIZED_CHAT_ID,
-                                text=f"🔔 *Target 1 Hit in {target_hit_acc}!* (Manual Mode Active)",
+                                text=alert_text,
                                 parse_mode="Markdown"
                             )
-                    else:
-                        success, msg = check_dual_market_depth_and_exit(smart_target, target_hit_acc)
-                        if success:
-                            active_positions[acc_key] = False
-                            first_target_hit = True
-                            first_hit_account = target_hit_acc
-                            other_acc = "Phone B" if target_hit_acc == "Phone A" else "Phone A"
-                            
-                            keyboard = [[
-                                InlineKeyboardButton("✏️ Custom 2nd Target", callback_data="change_target_2"),
-                                InlineKeyboardButton("🚨 Exit All Positions", callback_data="confirm_exit_all")
-                            ]]
-                            await context.bot.send_message(
-                                chat_id=AUTHORIZED_CHAT_ID,
-                                text=f"🎯 *Target 1 Achieved in {target_hit_acc}!* (Profit: ₹{target_pnl:,.2f})\n\n🔄 *{other_acc}* Active for Target 2 (₹{current_target_2}).",
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup(keyboard)
-                            )
+                            t1_alert_msg_id = msg.message_id
 
+                    if manual_mode_t1:
+                        send_telegram_async(context, f"🔔 *Manual Mode Active for Target 1!* Please exit manually.")
+                    else:
+                        is_exiting_t1 = True
+
+                        async def exit_worker_t1(s_obj, a_name, a_key):
+                            nonlocal is_exiting_t1, first_target_hit, first_hit_account
+                            success, msg_txt = await smart_limit_exit_all(s_obj, a_name)
+                            if success:
+                                active_positions[a_key] = False
+                                first_target_hit = True
+                                first_hit_account = a_name
+                                other_acc = "Phone B" if a_name == "Phone A" else "Phone A"
+                                
+                                keyboard = [[
+                                    InlineKeyboardButton("✏️ Custom 2nd Target", callback_data="change_target_2"),
+                                    InlineKeyboardButton("🚨 Exit All Positions", callback_data="confirm_exit_all")
+                                ]]
+                                
+                                success_text = (
+                                    f"✅ *Target 1 EXECUTED & CLOSED for {a_name}!*\n\n"
+                                    f"🔄 *{other_acc}* is now active for Target 2 (₹{current_target_2})."
+                                )
+                                send_telegram_async(context, success_text, InlineKeyboardMarkup(keyboard))
+                            is_exiting_t1 = False
+
+                        asyncio.create_task(exit_worker_t1(smart_target, target_hit_acc, acc_key))
+
+            # ---------------------------------------------------------
+            # PHASE 2: TARGET 2 MONITORING (Supports Profit or Stop-loss)
+            # ---------------------------------------------------------
             else:
                 rem_key = "Phone_B" if first_hit_account == "Phone A" else "Phone_A"
                 rem_name = "Phone B" if first_hit_account == "Phone A" else "Phone A"
                 rem_smart = smart_b if rem_key == "Phone_B" else smart_a
                 rem_pnl = pnl_b if rem_key == "Phone_B" else pnl_a
 
-                if active_positions[rem_key] and rem_pnl >= current_target_2:
-                    if manual_mode_t2:
-                        if not notified_manual_t2:
-                            notified_manual_t2 = True
-                            await context.bot.send_message(
+                t2_triggered = False
+                if current_target_2 >= 0 and rem_pnl >= current_target_2:
+                    t2_triggered = True
+                elif current_target_2 < 0 and rem_pnl <= current_target_2:
+                    t2_triggered = True
+
+                if active_positions[rem_key] and t2_triggered and not is_exiting_t2:
+                    current_time = time.time()
+                    if (current_time - last_telegram_t2_time) >= 30 or t2_alert_msg_id is None:
+                        t2_alert_count += 1
+                        last_telegram_t2_time = current_time
+                        
+                        t2_text = (
+                            f"🎯 *TARGET 2 TRIGGERED in {rem_name}!*\n"
+                            f"🔔 *Notification #{t2_alert_count}*\n\n"
+                            f"💰 *Current P&L:* ₹{rem_pnl:,.2f}\n"
+                            f"⏳ *Attempting Safe Exit...*"
+                        )
+
+                        if t2_alert_msg_id:
+                            try:
+                                await context.bot.edit_message_text(
+                                    chat_id=AUTHORIZED_CHAT_ID,
+                                    message_id=t2_alert_msg_id,
+                                    text=t2_text,
+                                    parse_mode="Markdown"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            msg = await context.bot.send_message(
                                 chat_id=AUTHORIZED_CHAT_ID,
-                                text=f"🔔 *Target 2 Hit in {rem_name}!* (Manual Mode Active)",
+                                text=t2_text,
                                 parse_mode="Markdown"
                             )
+                            t2_alert_msg_id = msg.message_id
+
+                    if manual_mode_t2:
+                        send_telegram_async(context, f"🔔 *Manual Mode Active for Target 2!* Please exit manually.")
                     else:
-                        success, msg = check_dual_market_depth_and_exit(rem_smart, rem_name)
-                        if success:
-                            active_positions[rem_key] = False
-                            is_monitoring = False
-                            reset_trade_specific_flags()
+                        is_exiting_t2 = True
 
-                            final_pnl_a = get_account_pnl(smart_a) if smart_a else 0.0
-                            final_pnl_b = get_account_pnl(smart_b) if smart_b else 0.0
-                            total_brokerage = ESTIMATED_BROKERAGE_PER_ORDER * 2
-                            net_pnl = (final_pnl_a + final_pnl_b) - total_brokerage
+                        async def exit_worker_t2(r_smart, r_name, r_key):
+                            nonlocal is_exiting_t2
+                            global is_monitoring
+                            success, msg_txt = await smart_limit_exit_all(r_smart, r_name)
+                            if success:
+                                active_positions[r_key] = False
+                                is_monitoring = False
+                                reset_trade_specific_flags()
 
-                            today_date = datetime.now().strftime("%d-%m-%Y")
-                            history_manager.save_record(today_date, final_pnl_a, final_pnl_b, total_brokerage, net_pnl)
+                                final_pnl_a = get_account_pnl(smart_a) if smart_a else 0.0
+                                final_pnl_b = get_account_pnl(smart_b) if smart_b else 0.0
+                                total_brokerage = ESTIMATED_BROKERAGE_PER_ORDER * 2
+                                net_pnl = (final_pnl_a + final_pnl_b) - total_brokerage
 
-                            await context.bot.send_message(
-                                chat_id=AUTHORIZED_CHAT_ID,
-                                text=(
+                                today_date = datetime.now().strftime("%d-%m-%Y")
+                                history_manager.save_record(today_date, final_pnl_a, final_pnl_b, total_brokerage, net_pnl)
+
+                                summary_text = (
                                     f"🎉 *Trade Complete Summary*\n\n"
                                     f"• *Phone A:* ₹{final_pnl_a:,.2f}\n"
                                     f"• *Phone B:* ₹{final_pnl_b:,.2f}\n"
                                     f"• *Brokerage:* -₹{total_brokerage:,.2f}\n"
                                     f"─────────────────\n"
                                     f"💰 *Net PnL:* ₹{net_pnl:,.2f}"
-                                ),
-                                parse_mode="Markdown"
-                            )
+                                )
+                                send_telegram_async(context, summary_text)
+                            is_exiting_t2 = False
 
-            await asyncio.sleep(1)
+                        asyncio.create_task(exit_worker_t2(rem_smart, rem_name, rem_key))
+
+            await asyncio.sleep(0.3)
 
         except Exception as e:
             logging.error(f"Error in Monitoring Loop: {str(e)}")
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.5)
 
 # -------------------------------------------------------------
 # 9. COMMANDS & MESSAGES
@@ -418,10 +552,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ["active", "activate", "एक्टिव"]:
         is_api_active = True
         await update.message.reply_text("✅ *API System Activated!*", parse_mode="Markdown")
-        return
-
-    if text == "check":
-        await perform_system_health_check(update)
         return
 
     if text in ["manual 1", "manual1"]:
@@ -530,11 +660,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif query.data == "confirm_run_nifty":
-        await query.edit_message_text("⏳ *Executing 'Nifty' Basket...*", parse_mode="Markdown")
+        await query.edit_message_text("⏳ *Executing Hedged Nifty Baskets...*", parse_mode="Markdown")
         reset_trade_specific_flags()
 
-        res_a, msg_a = await execute_named_basket(smart_a, "Nifty")
-        res_b, msg_b = await execute_named_basket(smart_b, "Nifty")
+        res_a, msg_a = await execute_hedged_nifty_basket(smart_a, "Phone_A")
+        res_b, msg_b = await execute_hedged_nifty_basket(smart_b, "Phone_B")
 
         if res_a and res_b:
             active_positions["Phone_A"] = True
@@ -544,10 +674,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             keyboard = [[InlineKeyboardButton("🚨 EXIT ALL POSITIONS", callback_data="confirm_exit_all")]]
             await query.edit_message_text(
-                text=f"🎉 *'Nifty' Baskets Executed!*\n\n🎯 *T1:* ₹{current_target_1} | *T2:* ₹{current_target_2}",
+                text=f"🎉 *Hedged Nifty Baskets Executed!*\n\n🎯 *T1:* ₹{current_target_1} | *T2:* ₹{current_target_2}",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
+        else:
+            await query.edit_message_text(f"❌ *Execution Failed:*\n\n• Phone A: {msg_a}\n• Phone B: {msg_b}")
 
     elif query.data == "change_target_2":
         user_state["awaiting_t2"] = True
@@ -557,8 +689,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_monitoring = False
         await query.edit_message_text("⏳ *Closing all trades...*", parse_mode="Markdown")
         
-        res_a, msg_a = real_square_off_all(smart_a, "Phone A")
-        res_b, msg_b = real_square_off_all(smart_b, "Phone B")
+        res_a, msg_a = await smart_limit_exit_all(smart_a, "Phone A")
+        res_b, msg_b = await smart_limit_exit_all(smart_b, "Phone B")
 
         active_positions["Phone_A"] = False
         active_positions["Phone_B"] = False
@@ -577,7 +709,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT, message_handler))
-    print("Trading Bot is running...")
+    print("Trading Bot is running with Non-Blocking Async Architecture...")
     app.run_polling()
 
 if __name__ == "__main__":
