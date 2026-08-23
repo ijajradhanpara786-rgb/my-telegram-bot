@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = "8563018898:AAEFBuFkA3_p7cjiM9WrR83sqM7CCB7MMAQ"
 TELEGRAM_API_ID = 37534041
 TELEGRAM_API_HASH = "32fa9b9aecdff1ad567e236bf677f8ef"
 
-# ✅ आपकी Verified Telegram Chat ID ऑटो-अपडेट कर दी गई है
+# Verified Telegram Chat ID
 AUTHORIZED_CHAT_ID = "6562604119"
 
 PHONE_A = {
@@ -115,7 +115,10 @@ history_manager = TradeHistoryManager()
 # -------------------------------------------------------------
 def is_authorized(update: Update):
     user_id = str(update.effective_user.id)
-    return user_id == str(AUTHORIZED_CHAT_ID)
+    if user_id != str(AUTHORIZED_CHAT_ID):
+        logging.warning(f"Unauthorized access attempt by Chat ID: {user_id}")
+        return False
+    return True
 
 def reset_trade_specific_flags():
     global manual_mode_t1, manual_mode_t2
@@ -169,7 +172,56 @@ def check_dual_market_depth_and_exit(smart_obj, account_name):
         return False, f"Dual Depth Check Error: {str(e)}"
 
 # -------------------------------------------------------------
-# 7. LIVE MONITORING LOOP
+# 7. SYSTEM HEALTH CHECK LOGIC
+# -------------------------------------------------------------
+async def perform_system_health_check(update: Update):
+    global smart_a, smart_b
+    await update.message.reply_text("⏳ *Checking System Health, API Connections & Funds...*", parse_mode="Markdown")
+    
+    issues = []
+    fund_a, fund_b = "N/A", "N/A"
+
+    if not smart_a:
+        issues.append("Phone A: Session Active नहीं है (Market Closed or Login Pending).")
+    else:
+        try:
+            rms_a = smart_a.rmsLimit()
+            if rms_a and rms_a.get('status') and rms_a.get('data'):
+                cash_a = float(rms_a['data'].get('net', 0.0))
+                fund_a = f"₹{cash_a:,.2f}"
+                if cash_a < 1000: issues.append(f"Phone A: Low Funds ({fund_a})")
+            else: issues.append("Phone A: Fund Data Read Fail")
+        except Exception as e: issues.append(f"Phone A Error: {str(e)}")
+
+    if not smart_b:
+        issues.append("Phone B: Session Active नहीं है (Market Closed or Login Pending).")
+    else:
+        try:
+            rms_b = smart_b.rmsLimit()
+            if rms_b and rms_b.get('status') and rms_b.get('data'):
+                cash_b = float(rms_b['data'].get('net', 0.0))
+                fund_b = f"₹{cash_b:,.2f}"
+                if cash_b < 1000: issues.append(f"Phone B: Low Funds ({fund_b})")
+            else: issues.append("Phone B: Fund Data Read Fail")
+        except Exception as e: issues.append(f"Phone B Error: {str(e)}")
+
+    if not issues:
+        resp = (
+            f"✅ *100% System Working*\n\n"
+            f"• *API Status:* Both Connected & Active\n"
+            f"• *System Control:* {'ACTIVE' if is_api_active else 'DEACTIVE'}\n\n"
+            f"💰 *Available Funds:*\n"
+            f"• *Phone A Funds:* {fund_a}\n"
+            f"• *Phone B Funds:* {fund_b}"
+        )
+    else:
+        reasons = "\n".join([f"• {i}" for i in issues])
+        resp = f"⚠️ *System Health Report*\n\n*Status/Issues:*\n{reasons}\n\n💰 *Funds:*\n• Phone A: {fund_a}\n• Phone B: {fund_b}"
+
+    await update.message.reply_text(resp, parse_mode="Markdown")
+
+# -------------------------------------------------------------
+# 8. LIVE MONITORING LOOP
 # -------------------------------------------------------------
 async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
     global is_monitoring, active_positions, current_target_1, current_target_2
@@ -227,7 +279,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
                             
                             keyboard = [[
                                 InlineKeyboardButton("✏️ Custom 2nd Target", callback_data="change_target_2"),
-                                InlineKeyboardButton("🚨 Exit All Positions", callback_data="ask_confirm_exit_all")
+                                InlineKeyboardButton("🚨 Exit All Positions", callback_data="confirm_exit_all")
                             ]]
                             await context.bot.send_message(
                                 chat_id=AUTHORIZED_CHAT_ID,
@@ -303,7 +355,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(2)
 
 # -------------------------------------------------------------
-# 8. START & COMMANDS (24/7 Working)
+# 9. START & COMMANDS
 # -------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update): return
@@ -326,25 +378,52 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global is_api_active, current_target_1, current_target_2
-    global manual_mode_t1, manual_mode_t2
+    global manual_mode_t1, manual_mode_t2, user_state
 
     if not is_authorized(update): return
 
     text = update.message.text.strip().lower()
 
-    if text == "deactive":
+    # SYSTEM CONTROL COMMANDS (Always Work)
+    if text in ["deactive", "deactivate", "डीएक्टिव"]:
         is_api_active = False
-        await update.message.reply_text("🚫 *API System Deactivated!*")
+        await update.message.reply_text("🚫 *API System Deactivated!* (बॉट अब कोई भी नया ऑर्डर या ट्रेड प्रोसेस नहीं करेगा)", parse_mode="Markdown")
         return
 
-    if text == "active":
+    if text in ["active", "activate", "एक्टिव"]:
         is_api_active = True
-        await update.message.reply_text("✅ *API System Activated!*")
+        await update.message.reply_text("✅ *API System Activated!* (बॉट एक्टिव हो गया है)", parse_mode="Markdown")
         return
+
+    if text == "check":
+        await perform_system_health_check(update)
+        return
+
+    if text in ["manual 1", "manual1"]:
+        manual_mode_t1 = True
+        await update.message.reply_text("⚠️ *Manual Mode for Target 1 Active!*", parse_mode="Markdown")
+        return
+
+    if text in ["manual 2", "manual2"]:
+        manual_mode_t2 = True
+        await update.message.reply_text("⚠️ *Manual Mode for Target 2 Active!*", parse_mode="Markdown")
+        return
+
+    # Custom Target 2 Handling
+    if user_state.get("awaiting_t2"):
+        try:
+            val = float(text)
+            current_target_2 = val
+            user_state["awaiting_t2"] = False
+            await update.message.reply_text(f"✅ *Target 2 Updated to ₹{current_target_2}!*", parse_mode="Markdown")
+            return
+        except ValueError:
+            await update.message.reply_text("❌ कृपया सही नंबर (Amount) दर्ज करें। उदाहरण: `200`")
+            return
 
     if text == "pnl":
         if not smart_a and not smart_b:
-            await update.message.reply_text("ℹ️ *Market/Session Closed.* Check saved logs using `history DD-MM-YYYY`")
+            await update.message.reply_text("ℹ️ *Market/Session Closed.* Check saved logs using `history DD-MM-YYYY`", parse_mode="Markdown")
             return
         pnl_a = get_account_pnl(smart_a)
         pnl_b = get_account_pnl(smart_b)
@@ -372,25 +451,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown"
             )
         else:
-            await update.message.reply_text(f"❌ *No record found for {target_date}*")
+            await update.message.reply_text(f"❌ *No record found for {target_date}*", parse_mode="Markdown")
         return
 
+    # BLOCK TRADING ACTIONS IF SYSTEM IS DEACTIVATED
     if not is_api_active:
-        await update.message.reply_text("System Deactivated.")
+        await update.message.reply_text("⚠️ System is currently *DEACTIVATED*. टाइप करें `active` चालू करने के लिए।", parse_mode="Markdown")
         return
 
     if text == "start":
         await start_command(update, context)
-        return
-
-    if text == "manual 1":
-        manual_mode_t1 = True
-        await update.message.reply_text("⚠️ *Manual Mode for Target 1 Active!*")
-        return
-
-    if text == "manual 2":
-        manual_mode_t2 = True
-        await update.message.reply_text("⚠️ *Manual Mode for Target 2 Active!*")
         return
 
     if text == "exit all":
@@ -406,13 +476,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 # -------------------------------------------------------------
-# 9. BUTTON HANDLER
+# 10. BUTTON HANDLER
 # -------------------------------------------------------------
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global smart_a, smart_b, is_monitoring, active_positions
+    global smart_a, smart_b, is_monitoring, active_positions, user_state
     
     if not is_authorized(update): return
-    if not is_api_active: return
+    if not is_api_active: 
+        await update.callback_query.answer("⚠️ System is DEACTIVATED!", show_alert=True)
+        return
 
     query = update.callback_query
     await query.answer()
@@ -463,6 +535,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
+    elif query.data == "change_target_2":
+        user_state["awaiting_t2"] = True
+        await query.message.reply_text("✏️ *Target 2 का नया Amount दर्ज करें (उदा. 200, 300):*", parse_mode="Markdown")
+
     elif query.data == "confirm_exit_all":
         is_monitoring = False
         active_positions["Phone_A"] = False
@@ -474,7 +550,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ *Cancelled.*", parse_mode="Markdown")
 
 # -------------------------------------------------------------
-# 10. MAIN ENTRY
+# 11. MAIN ENTRY
 # -------------------------------------------------------------
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
