@@ -1,12 +1,4 @@
-telethon
-python-telegram-bot
 smartapi-python
-logzero
-websocket-client
-pyjwt
-requests
-asyncio
+python-telegram-bot
 pyotp
-urllib3
-six
-certifi
+requests
