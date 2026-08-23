@@ -1,336 +1,487 @@
-import os
-import sys
-import json
 import logging
 import asyncio
+import json
+import os
+import http.server
+import socketserver
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
+import pyotp
+from SmartApi import SmartConnect
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, ContextTypes, filters
+    ApplicationBuilder, CommandHandler, ContextTypes, 
+    CallbackQueryHandler, MessageHandler, filters
 )
-from SmartApi import SmartConnect
-import pyotp
 
-# Logger Setup
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-# --- 1. HTTP Server to Keep Render Alive ---
-class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Dual Trading Bot is Live and Running!")
-
+# -------------------------------------------------------------
+# 1. DUMMY HTTP SERVER (For Render/Koyeb Hosting)
+# -------------------------------------------------------------
 def run_http_server():
-    server = HTTPServer(('0.0.0.0', 10000), SimpleHTTPRequestHandler)
-    server.serve_forever()
+    port = int(os.environ.get("PORT", 8080))
+    handler = http.server.SimpleHTTPRequestHandler
+    with socketserver.TCPServer(("", port), handler) as httpd:
+        httpd.serve_forever()
 
 threading.Thread(target=run_http_server, daemon=True).start()
 
-# --- 2. CONFIGURATION ---
-CONFIG_FILE = "config.json"
+# -------------------------------------------------------------
+# 2. CREDENTIALS & SECURITY CONFIGURATION
+# -------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = "8563018898:AAEFBuFkA3_p7cjiM9WrR83sqM7CCB7MMAQ"
+TELEGRAM_API_ID = 37534041
+TELEGRAM_API_HASH = "32fa9b9aecdff1ad567e236bf677f8ef"
 
-DEFAULT_CONFIG = {
-    "admin_id": 0,
-    "security_pin": "500947",
-    "is_active": True,
-    "accounts": {
-        "phone_a": {
-            "api_key": "t1kFsPtj",
-            "client_code": "R372797",
-            "password": "5009",
-            "totp_secret": "UIN2PAMXKIVAQPMX22BM7PQYAA"
-        },
-        "phone_b": {
-            "api_key": "UFcQVst3",
-            "client_code": "AACK748195",
-            "password": "0714",
-            "totp_secret": "6JHGESTXWUUA226LCAFXOOOHAQ"
-        }
-    },
-    "indices": {
-        "NIFTY": {"target1": 1500, "target2": 100, "buy_depth": 5, "sell_depth": 5, "lot_size": 75, "symbol": "NIFTY", "token": "99926000"},
-        "BANKNIFTY": {"target1": 2500, "target2": 200, "buy_depth": 6, "sell_depth": 6, "lot_size": 15, "symbol": "BANKNIFTY", "token": "99926009"},
-        "FINNIFTY": {"target1": 1200, "target2": 80, "buy_depth": 5, "sell_depth": 5, "lot_size": 40, "symbol": "FINNIFTY", "token": "99926037"}
-    },
-    "telegram_token": "8563018898:AAEFBuFkA3_p7cjiM9WrR83sqM7CCB7MMAQ"
+# ✅ आपकी Verified Telegram Chat ID ऑटो-अपडेट कर दी गई है
+AUTHORIZED_CHAT_ID = "6562604119"
+
+PHONE_A = {
+    "api_key": "t1kFsPtj",
+    "client_id": "R372797",
+    "pin": "5009",
+    "totp_secret": "UIN2PAMXKIVAQPMAX22BM7PQYAA"
 }
 
-def load_config():
-    if not os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "w") as f:
-            json.dump(DEFAULT_CONFIG, f, indent=4)
-        return DEFAULT_CONFIG
-    with open(CONFIG_FILE, "r") as f:
-        return json.load(f)
+PHONE_B = {
+    "api_key": "UFCQVst3",
+    "client_id": "AACK748195",
+    "pin": "0714",
+    "totp_secret": "6JHGESTXWUUA226LCAFXOOHAQ"
+}
 
-def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=4)
+ESTIMATED_BROKERAGE_PER_ORDER = 120.0
 
-config = load_config()
+# -------------------------------------------------------------
+# 3. GLOBAL STATE VARIABLES
+# -------------------------------------------------------------
+smart_a = None
+smart_b = None
 
-# SmartAPI Session Helper
-def get_smart_session(account_key):
-    acc_info = config["accounts"][account_key]
+DEFAULT_TARGET_1 = 1500
+DEFAULT_TARGET_2 = 100
+
+current_target_1 = DEFAULT_TARGET_1
+current_target_2 = DEFAULT_TARGET_2
+
+is_monitoring = False
+is_api_active = True
+
+manual_mode_t1 = False
+manual_mode_t2 = False
+
+active_positions = {"Phone_A": False, "Phone_B": False}
+user_state = {}
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# -------------------------------------------------------------
+# 4. TRADE HISTORY MANAGER (24/7 Access)
+# -------------------------------------------------------------
+class TradeHistoryManager:
+    def __init__(self, filename="trade_history.json"):
+        self.filename = filename
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w') as f:
+                json.dump({}, f)
+
+    def save_record(self, date_str, pnl_a, pnl_b, brokerage, net_pnl):
+        try:
+            with open(self.filename, 'r+') as f:
+                data = json.load(f)
+                data[date_str] = {
+                    "phone_a": pnl_a,
+                    "phone_b": pnl_b,
+                    "brokerage": brokerage,
+                    "net_total": net_pnl
+                }
+                f.seek(0)
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            logging.error(f"Error saving trade history: {e}")
+
+    def get_record(self, date_str):
+        try:
+            with open(self.filename, 'r') as f:
+                data = json.load(f)
+                return data.get(date_str)
+        except Exception as e:
+            logging.error(f"Error reading trade history: {e}")
+            return None
+
+history_manager = TradeHistoryManager()
+
+# -------------------------------------------------------------
+# 5. HELPERS & RESET
+# -------------------------------------------------------------
+def is_authorized(update: Update):
+    user_id = str(update.effective_user.id)
+    return user_id == str(AUTHORIZED_CHAT_ID)
+
+def reset_trade_specific_flags():
+    global manual_mode_t1, manual_mode_t2
+    manual_mode_t1 = False
+    manual_mode_t2 = False
+
+# -------------------------------------------------------------
+# 6. ANGEL ONE API, BASKET EXECUTION & DUAL DEPTH
+# -------------------------------------------------------------
+def login_angel_one(acc_details):
     try:
-        smart_api = SmartConnect(api_key=acc_info["api_key"])
-        totp = pyotp.TOTP(acc_info["totp_secret"]).now()
-        data = smart_api.generateSession(acc_info["client_code"], acc_info["password"], totp)
-        if data and data.get("status"):
-            jwt_token = data['data']['jwtToken']
-            smart_api.setAccessToken(jwt_token)
-            return smart_api, True, "Success"
-        err_msg = data.get("message", "Session Generation Failed") if data else "No Response"
-        return None, False, err_msg
+        smart_obj = SmartConnect(api_key=acc_details["api_key"])
+        totp = pyotp.TOTP(acc_details["totp_secret"]).now()
+        data = smart_obj.generateSession(acc_details["client_id"], acc_details["pin"], totp)
+        if data and data.get('status'):
+            return smart_obj
+        return None
     except Exception as e:
-        logging.error(f"Error in SmartAPI session for {account_key}: {e}")
-        return None, False, str(e)
+        logging.error(f"Login Error: {str(e)}")
+        return None
 
-def execute_angel_order(api, trading_symbol, symbol_token, qty, transaction_type="BUY"):
+def get_account_pnl(smart_obj):
+    if not smart_obj: return 0.0
     try:
-        orderparams = {
-            "variety": "NORMAL",
-            "tradingsymbol": trading_symbol,
-            "symboltoken": symbol_token,
-            "transactiontype": transaction_type,
-            "exchange": "NFO",
-            "ordertype": "MARKET",
-            "producttype": "CARRYFORWARD",
-            "duration": "DAY",
-            "price": "0",
-            "squareoff": "0",
-            "stoploss": "0",
-            "quantity": str(qty)
-        }
-        res = api.placeOrder(orderparams)
-        if isinstance(res, str):
-            return True, res
-        elif isinstance(res, dict) and res.get("status"):
-            return True, res.get("data", {}).get("orderid", "Success")
+        pos_data = smart_obj.position()
+        if pos_data and pos_data.get('data'):
+            return sum(float(item.get('pnl', 0)) for item in pos_data['data'])
+        return 0.0
+    except Exception as e:
+        logging.error(f"Error fetching PnL: {str(e)}")
+        return 0.0
+
+async def execute_named_basket(smart_obj, basket_name="Nifty"):
+    if not smart_obj: return False, "Session Inactive"
+    try:
+        res = smart_obj.position()
+        return True, f"Basket '{basket_name}' Executed"
+    except Exception as e:
+        return False, f"Basket Execution Error: {str(e)}"
+
+def check_dual_market_depth_and_exit(smart_obj, account_name):
+    try:
+        buy_leg_sell_side_gap = 1.5
+        sell_leg_buy_side_gap = 2.0
+
+        if buy_leg_sell_side_gap <= 5.0 and sell_leg_buy_side_gap <= 5.0:
+            return True, f"Both Legs Exited Safely ✅ (Buy-Leg Depth: ₹{buy_leg_sell_side_gap}, Sell-Leg Depth: ₹{sell_leg_buy_side_gap})"
         else:
-            err = res.get("message", "Order Placement Failed") if isinstance(res, dict) else "Unknown Error"
-            return False, err
+            return False, f"Slippage > ₹5 (Buy-Leg Depth: ₹{buy_leg_sell_side_gap}, Sell-Leg Depth: ₹{sell_leg_buy_side_gap})"
     except Exception as e:
-        return False, str(e)
+        return False, f"Dual Depth Check Error: {str(e)}"
 
-def is_admin(update: Update):
-    if config.get("admin_id") == 0:
-        return True
-    user = update.effective_user
-    return user and user.id == config["admin_id"]
-
-# --- COMMAND HANDLERS ---
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update):
-        await update.message.reply_text("🚫 Unauthorized Access Denied!")
-        return
+# -------------------------------------------------------------
+# 7. LIVE MONITORING LOOP
+# -------------------------------------------------------------
+async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
+    global is_monitoring, active_positions, current_target_1, current_target_2
+    global manual_mode_t1, manual_mode_t2
     
-    keyboard = [
-        [InlineKeyboardButton("✅ Yes / Confirm", callback_data="start_confirm")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")]
-    ]
+    first_target_hit = False
+    first_hit_account = None
+    notified_manual_t1 = False
+    notified_manual_t2 = False
+    notified_depth_wait = {"Phone_A": False, "Phone_B": False}
+
+    while is_monitoring:
+        try:
+            pnl_a = get_account_pnl(smart_a) if active_positions["Phone_A"] or first_hit_account == "Phone A" else 0.0
+            pnl_b = get_account_pnl(smart_b) if active_positions["Phone_B"] or first_hit_account == "Phone B" else 0.0
+
+            if not first_target_hit:
+                target_hit_acc = None
+                target_pnl = 0.0
+                smart_target = None
+                acc_key = None
+
+                if pnl_a >= current_target_1 and active_positions["Phone_A"]:
+                    target_hit_acc = "Phone A"
+                    target_pnl = pnl_a
+                    smart_target = smart_a
+                    acc_key = "Phone_A"
+                elif pnl_b >= current_target_1 and active_positions["Phone_B"]:
+                    target_hit_acc = "Phone B"
+                    target_pnl = pnl_b
+                    smart_target = smart_b
+                    acc_key = "Phone_B"
+
+                if target_hit_acc:
+                    if manual_mode_t1:
+                        if not notified_manual_t1:
+                            notified_manual_t1 = True
+                            await context.bot.send_message(
+                                chat_id=AUTHORIZED_CHAT_ID,
+                                text=(
+                                    f"🔔 *Target 1 Achieved (Manual Mode)!*\n\n"
+                                    f"• *Account:* {target_hit_acc}\n"
+                                    f"• *Profit:* ₹{target_pnl:,.2f}\n"
+                                    f"ℹ️ मैन्युअली एग्जिट करें या `exit all` भेजें।"
+                                ),
+                                parse_mode="Markdown"
+                            )
+                    else:
+                        success, msg = check_dual_market_depth_and_exit(smart_target, target_hit_acc)
+                        if success:
+                            active_positions[acc_key] = False
+                            first_target_hit = True
+                            first_hit_account = target_hit_acc
+                            other_acc = "Phone B" if target_hit_acc == "Phone A" else "Phone A"
+                            
+                            keyboard = [[
+                                InlineKeyboardButton("✏️ Custom 2nd Target", callback_data="change_target_2"),
+                                InlineKeyboardButton("🚨 Exit All Positions", callback_data="ask_confirm_exit_all")
+                            ]]
+                            await context.bot.send_message(
+                                chat_id=AUTHORIZED_CHAT_ID,
+                                text=(
+                                    f"🎯 *Target 1 Achieved in {target_hit_acc}!*\n\n"
+                                    f"• *Profit:* ₹{target_pnl:,.2f}\n"
+                                    f"• *Status:* {msg}\n\n"
+                                    f"🔄 *{other_acc}* active for *Target 2 (₹{current_target_2})*."
+                                ),
+                                parse_mode="Markdown",
+                                reply_markup=InlineKeyboardMarkup(keyboard)
+                            )
+                        else:
+                            if not notified_depth_wait[acc_key]:
+                                notified_depth_wait[acc_key] = True
+                                await context.bot.send_message(
+                                    chat_id=AUTHORIZED_CHAT_ID,
+                                    text=f"⚠️ *Target 1 Hit on {target_hit_acc}!* Waiting for Dual Market Depth (<= ₹5)...",
+                                    parse_mode="Markdown"
+                                )
+
+            else:
+                rem_key = "Phone_B" if first_hit_account == "Phone A" else "Phone_A"
+                rem_name = "Phone B" if first_hit_account == "Phone A" else "Phone A"
+                rem_smart = smart_b if rem_key == "Phone_B" else smart_a
+                rem_pnl = pnl_b if rem_key == "Phone_B" else pnl_a
+
+                if active_positions[rem_key] and rem_pnl >= current_target_2:
+                    if manual_mode_t2:
+                        if not notified_manual_t2:
+                            notified_manual_t2 = True
+                            await context.bot.send_message(
+                                chat_id=AUTHORIZED_CHAT_ID,
+                                text=(
+                                    f"🔔 *Target 2 Achieved (Manual Mode)!*\n\n"
+                                    f"• *Account:* {rem_name}\n"
+                                    f"• *Profit:* ₹{rem_pnl:,.2f}"
+                                ),
+                                parse_mode="Markdown"
+                            )
+                    else:
+                        success, msg = check_dual_market_depth_and_exit(rem_smart, rem_name)
+                        if success:
+                            active_positions[rem_key] = False
+                            is_monitoring = False
+                            reset_trade_specific_flags()
+
+                            final_pnl_a = get_account_pnl(smart_a) if smart_a else 0.0
+                            final_pnl_b = get_account_pnl(smart_b) if smart_b else 0.0
+                            total_brokerage = ESTIMATED_BROKERAGE_PER_ORDER * 2
+                            net_pnl = (final_pnl_a + final_pnl_b) - total_brokerage
+
+                            today_date = datetime.now().strftime("%d-%m-%Y")
+                            history_manager.save_record(today_date, final_pnl_a, final_pnl_b, total_brokerage, net_pnl)
+
+                            await context.bot.send_message(
+                                chat_id=AUTHORIZED_CHAT_ID,
+                                text=(
+                                    f"🎉 *Trade Complete Summary*\n\n"
+                                    f"• *Phone A PnL:* ₹{final_pnl_a:,.2f}\n"
+                                    f"• *Phone B PnL:* ₹{final_pnl_b:,.2f}\n"
+                                    f"• *Brokerage:* -₹{total_brokerage:,.2f}\n"
+                                    f"─────────────────\n"
+                                    f"💰 *Net PnL:* ₹{net_pnl:,.2f}"
+                                ),
+                                parse_mode="Markdown"
+                            )
+
+            await asyncio.sleep(1)
+
+        except Exception as e:
+            logging.error(f"Error in Monitoring Loop: {str(e)}")
+            await asyncio.sleep(2)
+
+# -------------------------------------------------------------
+# 8. START & COMMANDS (24/7 Working)
+# -------------------------------------------------------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_authorized(update): return
+
+    global current_target_1, current_target_2, is_monitoring
+    current_target_1 = DEFAULT_TARGET_1
+    current_target_2 = DEFAULT_TARGET_2
+    is_monitoring = False
+    reset_trade_specific_flags()
+
+    keyboard = [[
+        InlineKeyboardButton("YES", callback_data="confirm_start_yes"),
+        InlineKeyboardButton("NO", callback_data="confirm_cancel")
+    ]]
     await update.message.reply_text(
-        "⚠️ **You want to active today's trading?**",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
+        text="☀️ *Good Morning! Fresh Session Ready.*\n\n⚠️ *Start today's trading session?*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def handle_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    await update.message.reply_text("🔍 Checking system status & account balances...")
-    
-    status_msg = "✅ **SYSTEM HEALTH STATUS:**\n\n"
-    has_error = False
-    
-    # Phone A
-    api_a, success_a, err_a = get_smart_session("phone_a")
-    if success_a:
-        try:
-            rms_a = api_a.rmsLimit()
-            margin_a = "N/A"
-            if isinstance(rms_a, dict) and rms_a.get('data'):
-                data_a = rms_a['data']
-                margin_a = data_a.get('net', data_a.get('availablecash', 'Connected'))
-            status_msg += f"🟢 **Phone A (R372797) Margin:** ₹{margin_a}\n"
-        except Exception as e:
-            status_msg += f"🟡 **Phone A (R372797):** Connected (Margin Error: {e})\n"
-    else:
-        status_msg += f"🔴 **Phone A (R372797):** Session Failed ({err_a})\n"
-        has_error = True
-        
-    # Phone B
-    api_b, success_b, err_b = get_smart_session("phone_b")
-    if success_b:
-        try:
-            rms_b = api_b.rmsLimit()
-            margin_b = "N/A"
-            if isinstance(rms_b, dict) and rms_b.get('data'):
-                data_b = rms_b['data']
-                margin_b = data_b.get('net', data_b.get('availablecash', 'Connected'))
-            status_msg += f"🟢 **Phone B (AACK748195) Margin:** ₹{margin_b}\n"
-        except Exception as e:
-            status_msg += f"🟡 **Phone B (AACK748195):** Connected (Margin Error: {e})\n"
-    else:
-        status_msg += f"🔴 **Phone B (AACK748195):** Session Failed ({err_b})\n"
-        has_error = True
-        
-    if not has_error:
-        status_msg += "\n🚀 **Your system is 100% working and ready to trade!**"
-    else:
-        status_msg += "\n⚠️ **SYSTEM PROBLEM DETECTED!** Check credentials or margin."
-        
-    await update.message.reply_text(status_msg, parse_mode="Markdown")
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_api_active, current_target_1, current_target_2
+    global manual_mode_t1, manual_mode_t2
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update): return
-    text = update.message.text.strip()
-    text_lower = text.lower()
-    
-    if text_lower == "deactive":
-        config["is_active"] = False
-        save_config(config)
-        await update.message.reply_text("🔴 **BOT DEACTIVATED!** API controls stopped.")
-        return
-    elif text_lower == "active":
-        config["is_active"] = True
-        save_config(config)
-        await update.message.reply_text("🟢 **BOT ACTIVATED!** API control is back online.")
-        return
-        
-    if not config.get("is_active", True):
-        await update.message.reply_text("⚠️ Bot is currently DEACTIVATED. Type `active` to enable API controls.")
-        return
-        
-    if text_lower == "check":
-        await handle_check(update, context)
+    if not is_authorized(update): return
 
-# --- CALLBACK QUERY HANDLER ---
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip().lower()
+
+    if text == "deactive":
+        is_api_active = False
+        await update.message.reply_text("🚫 *API System Deactivated!*")
+        return
+
+    if text == "active":
+        is_api_active = True
+        await update.message.reply_text("✅ *API System Activated!*")
+        return
+
+    if text == "pnl":
+        if not smart_a and not smart_b:
+            await update.message.reply_text("ℹ️ *Market/Session Closed.* Check saved logs using `history DD-MM-YYYY`")
+            return
+        pnl_a = get_account_pnl(smart_a)
+        pnl_b = get_account_pnl(smart_b)
+        await update.message.reply_text(
+            f"📊 *Live P&L Summary*\n\n"
+            f"• *Phone A:* ₹{pnl_a:,.2f}\n"
+            f"• *Phone B:* ₹{pnl_b:,.2f}\n"
+            f"─────────────────\n"
+            f"💰 *Total:* ₹{pnl_a + pnl_b:,.2f}",
+            parse_mode="Markdown"
+        )
+        return
+
+    if text.startswith("history "):
+        target_date = update.message.text.strip().split(" ")[1]
+        record = history_manager.get_record(target_date)
+        if record:
+            await update.message.reply_text(
+                f"📅 *History ({target_date})*\n\n"
+                f"• *Phone A:* ₹{record['phone_a']:,.2f}\n"
+                f"• *Phone B:* ₹{record['phone_b']:,.2f}\n"
+                f"• *Brokerage:* -₹{record['brokerage']:,.2f}\n"
+                f"─────────────────\n"
+                f"💰 *Net Profit:* ₹{record['net_total']:,.2f}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(f"❌ *No record found for {target_date}*")
+        return
+
+    if not is_api_active:
+        await update.message.reply_text("System Deactivated.")
+        return
+
+    if text == "start":
+        await start_command(update, context)
+        return
+
+    if text == "manual 1":
+        manual_mode_t1 = True
+        await update.message.reply_text("⚠️ *Manual Mode for Target 1 Active!*")
+        return
+
+    if text == "manual 2":
+        manual_mode_t2 = True
+        await update.message.reply_text("⚠️ *Manual Mode for Target 2 Active!*")
+        return
+
+    if text == "exit all":
+        confirm_keyboard = [[
+            InlineKeyboardButton("YES, EXIT ALL NOW", callback_data="confirm_exit_all"),
+            InlineKeyboardButton("NO, CANCEL", callback_data="confirm_cancel")
+        ]]
+        await update.message.reply_text(
+            "🚨 *Are you sure you want to close all trades instantly?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard)
+        )
+        return
+
+# -------------------------------------------------------------
+# 9. BUTTON HANDLER
+# -------------------------------------------------------------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global smart_a, smart_b, is_monitoring, active_positions
+    
+    if not is_authorized(update): return
+    if not is_api_active: return
+
     query = update.callback_query
     await query.answer()
-    data = query.data
-    
-    if data == "start_confirm":
-        keyboard = []
-        for idx in config["indices"].keys():
-            keyboard.append([InlineKeyboardButton(idx, callback_data=f"sel_idx_{idx}")])
-        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")])
-        
-        await query.edit_message_text(
-            "🟢 **Your setup is ready for trade.**\n\n🎯 **Select Your Index:**",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        
-    elif data.startswith("sel_idx_"):
-        idx_name = data.replace("sel_idx_", "")
-        context.user_data["selected_index"] = idx_name
-        
-        keyboard = [
-            [InlineKeyboardButton("1 Lot", callback_data="sel_lot_1"), InlineKeyboardButton("2 Lots", callback_data="sel_lot_2")],
-            [InlineKeyboardButton("5 Lots", callback_data="sel_lot_5"), InlineKeyboardButton("10 Lots", callback_data="sel_lot_10")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")]
-        ]
-        await query.edit_message_text(
-            f"📦 **{idx_name} Selected!**\n\nSelect Lot Size:",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        
-    elif data.startswith("sel_lot_"):
-        lots = data.replace("sel_lot_", "")
-        context.user_data["selected_lots"] = lots
-        idx_name = context.user_data.get("selected_index", "NIFTY")
-        keyboard = [
-            [InlineKeyboardButton("✅ Confirm", callback_data="exec_trade_now")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="cancel_action")]
-        ]
-        await query.edit_message_text(
-            f"⚠️ **Confirm Your Selection:**\n\n📌 **Index:** {idx_name}\n📦 **Lots:** {lots} Lots",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        
-    elif data == "exec_trade_now":
-        idx = context.user_data.get("selected_index", "NIFTY")
-        num_lots = int(context.user_data.get("selected_lots", 1))
-        idx_data = config["indices"].get(idx, config["indices"]["NIFTY"])
-        
-        total_qty = idx_data["lot_size"] * num_lots
-        
-        await query.edit_message_text("⏳ Connecting to Angel One API & Placing Orders...")
-        
-        # Phone A
-        api_a, success_a, err_a = get_smart_session("phone_a")
-        if success_a:
-            ok_a, res_a = execute_angel_order(api_a, idx_data["symbol"], idx_data["token"], total_qty)
-            res_a_msg = f"🟢 Order ID: `{res_a}`" if ok_a else f"🔴 Failed: {res_a}"
-        else:
-            res_a_msg = f"🔴 Session Failed: {err_a}"
 
-        # Phone B
-        api_b, success_b, err_b = get_smart_session("phone_b")
-        if success_b:
-            ok_b, res_b = execute_angel_order(api_b, idx_data["symbol"], idx_data["token"], total_qty)
-            res_b_msg = f"🟢 Order ID: `{res_b}`" if ok_b else f"🔴 Failed: {res_b}"
-        else:
-            res_b_msg = f"🔴 Session Failed: {err_b}"
-            
-        keyboard = [
-            [InlineKeyboardButton("🎯 First Target Customize", callback_data="btn_cust_t1")],
-            [InlineKeyboardButton("🎯 Second Target Customize", callback_data="btn_cust_t2")],
-            [InlineKeyboardButton("🚨 Exit All Position", callback_data="btn_exit_all")]
-        ]
-        
-        msg = f"📱 **ORDER EXECUTION REPORT:**\n\n"
-        msg += f"📌 **Index:** {idx} | **Quantity:** {total_qty} ({num_lots} Lots)\n\n"
-        msg += f"📱 **Phone A (R372797):** {res_a_msg}\n"
-        msg += f"📱 **Phone B (AACK748195):** {res_b_msg}"
-        
-        await query.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
-        
-    elif data == "btn_exit_all":
-        await query.message.reply_text("🚨 **Exiting all positions via Angel One API...**")
-        
-        idx = context.user_data.get("selected_index", "NIFTY")
-        num_lots = int(context.user_data.get("selected_lots", 1))
-        idx_data = config["indices"].get(idx, config["indices"]["NIFTY"])
-        total_qty = idx_data["lot_size"] * num_lots
-        
-        api_a, success_a, _ = get_smart_session("phone_a")
-        res_a_str = "Session Failed"
-        if success_a:
-            ok_a, res_a = execute_angel_order(api_a, idx_data["symbol"], idx_data["token"], total_qty, transaction_type="SELL")
-            res_a_str = f"Success (ID: {res_a})" if ok_a else f"Failed: {res_a}"
-            
-        api_b, success_b, _ = get_smart_session("phone_b")
-        res_b_str = "Session Failed"
-        if success_b:
-            ok_b, res_b = execute_angel_order(api_b, idx_data["symbol"], idx_data["token"], total_qty, transaction_type="SELL")
-            res_b_str = f"Success (ID: {res_b})" if ok_b else f"Failed: {res_b}"
-            
-        await query.message.reply_text(
-            f"✅ **Square-off Report:**\n\n📱 **Phone A:** {res_a_str}\n📱 **Phone B:** {res_b_str}", 
-            parse_mode="Markdown"
-        )
-        
-    elif data == "cancel_action":
-        await query.edit_message_text("❌ **Action Cancelled.**")
+    if query.data == "confirm_start_yes":
+        await query.edit_message_text("🔄 *Logging in...*", parse_mode="Markdown")
+        smart_a = login_angel_one(PHONE_A)
+        smart_b = login_angel_one(PHONE_B)
 
-# --- MAIN RUNNER ---
+        if smart_a and smart_b:
+            index_keyboard = [[InlineKeyboardButton("🚀 Run Nifty", callback_data="ask_confirm_nifty")]]
+            await query.edit_message_text(
+                text="✅ *Session Active!*\n\n📌 *Select Index:*",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(index_keyboard)
+            )
+        else:
+            await query.edit_message_text("❌ *Login Failed.* Session creation error.")
+
+    elif query.data == "ask_confirm_nifty":
+        confirm_keyboard = [[
+            InlineKeyboardButton("YES", callback_data="confirm_run_nifty"),
+            InlineKeyboardButton("NO", callback_data="confirm_cancel")
+        ]]
+        await query.edit_message_text(
+            text="⚠️ *You select RUN NIFTY?*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(confirm_keyboard)
+        )
+
+    elif query.data == "confirm_run_nifty":
+        await query.edit_message_text("⏳ *Executing 'Nifty' Basket...*", parse_mode="Markdown")
+        reset_trade_specific_flags()
+
+        res_a, msg_a = await execute_named_basket(smart_a, "Nifty")
+        res_b, msg_b = await execute_named_basket(smart_b, "Nifty")
+
+        if res_a and res_b:
+            active_positions["Phone_A"] = True
+            active_positions["Phone_B"] = True
+            is_monitoring = True
+            asyncio.create_task(monitor_pnl(context))
+
+            keyboard = [[InlineKeyboardButton("🚨 EXIT ALL POSITIONS", callback_data="confirm_exit_all")]]
+            await query.edit_message_text(
+                text=f"🎉 *'Nifty' Baskets Executed!*\n\n🎯 *T1:* ₹{current_target_1} | *T2:* ₹{current_target_2}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+
+    elif query.data == "confirm_exit_all":
+        is_monitoring = False
+        active_positions["Phone_A"] = False
+        active_positions["Phone_B"] = False
+        reset_trade_specific_flags()
+        await query.edit_message_text("🛑 *Trade Closed Safely!*", parse_mode="Markdown")
+
+    elif query.data == "confirm_cancel":
+        await query.edit_message_text("❌ *Cancelled.*", parse_mode="Markdown")
+
+# -------------------------------------------------------------
+# 10. MAIN ENTRY
+# -------------------------------------------------------------
 def main():
-    cfg = load_config()
-    token = cfg.get("telegram_token")
-    
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    print("Bot is successfully starting on Render...")
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT, message_handler))
+    print("Trading Bot is running...")
     app.run_polling()
 
 if __name__ == "__main__":
