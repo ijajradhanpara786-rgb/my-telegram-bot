@@ -1,7 +1,5 @@
-python-telegram-bot
+python-telegram-bot>=20.0
 smartapi-python
 pyotp
 requests
-logzero
 flask
-websocket-client
