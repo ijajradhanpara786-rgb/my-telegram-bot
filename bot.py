@@ -44,7 +44,7 @@ PHONE_B = {
     "api_key": "UFCQVst3",
     "client_id": "AACK748195",
     "pin": "0714",
-    "totp_secret": "6JHGESTXWUUA226LCAFXOOHAQ"
+    "totp_secret": "6JHGESTXWUUA226LCAFXOOOHAQ"
 }
 
 ESTIMATED_BROKERAGE_PER_ORDER = 120.0
@@ -146,13 +146,16 @@ def reset_trade_specific_flags():
 def login_angel_one(acc_details):
     try:
         smart_obj = SmartConnect(api_key=acc_details["api_key"])
-        totp = pyotp.TOTP(acc_details["totp_secret"]).now()
+        # Clean secret key dynamically to eliminate spaces/formatting errors
+        clean_secret = acc_details["totp_secret"].strip().replace(" ", "").upper()
+        totp = pyotp.TOTP(clean_secret).now()
         data = smart_obj.generateSession(acc_details["client_id"], acc_details["pin"], totp)
         if data and data.get('status'):
             return smart_obj
+        logging.error(f"Login failed response: {data}")
         return None
     except Exception as e:
-        logging.error(f"Login Error: {str(e)}")
+        logging.error(f"Login Exception: {str(e)}")
         return None
 
 def get_account_pnl(smart_obj):
