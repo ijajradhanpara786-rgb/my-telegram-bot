@@ -1,5 +1,10 @@
-import sys
+# =============================================================
+# 0. ANGEL ONE / PYTHON 3.14 COMPATIBILITY PATCH (DO NOT MOVE)
+# =============================================================
 import logging
+logging.logger = logging.getLogger()
+
+import sys
 import asyncio
 import json
 import os
