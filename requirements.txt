@@ -1,4 +1,4 @@
 python-telegram-bot==20.3
-smartapi-python==1.4.6
+smartapi-python>=1.4.5
 pyotp==2.9.0
 requests==2.31.0
