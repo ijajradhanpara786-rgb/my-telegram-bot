@@ -1,3 +1,4 @@
+import sys
 import logging
 import asyncio
 import json
@@ -7,6 +8,13 @@ import socketserver
 import threading
 import time
 from datetime import datetime
+
+# -------------------------------------------------------------
+# 0. LOGZERO POLYFILL (Resolves missing logzero module error)
+# -------------------------------------------------------------
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+sys.modules['logzero'] = logging
+
 import pyotp
 import requests
 from SmartApi import SmartConnect
@@ -17,7 +25,7 @@ from telegram.ext import (
 )
 
 # -------------------------------------------------------------
-# 1. DUMMY HTTP SERVER (For 24/7 Hosting)
+# 1. DUMMY HTTP SERVER (For 24/7 Hosting on Render)
 # -------------------------------------------------------------
 def run_http_server():
     port = int(os.environ.get("PORT", 8080))
@@ -69,8 +77,6 @@ manual_mode_t2 = False
 
 active_positions = {"Phone_A": False, "Phone_B": False}
 user_state = {}
-
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
 # -------------------------------------------------------------
 # 4. TRADE HISTORY MANAGER
@@ -141,13 +147,20 @@ def reset_trade_specific_flags():
     manual_mode_t2 = False
 
 # -------------------------------------------------------------
-# 6. ANGEL ONE LOGIN, PNL & BASKET EXECUTION
+# 6. ANGEL ONE LOGIN WITH AUTO-PADDING FIX & PNL
 # -------------------------------------------------------------
 def login_angel_one(acc_details):
     try:
         smart_obj = SmartConnect(api_key=acc_details["api_key"])
-        # Clean secret key dynamically to eliminate spaces/formatting errors
+        
+        # Clean TOTP Secret Key
         clean_secret = acc_details["totp_secret"].strip().replace(" ", "").upper()
+        
+        # Auto-Pad Base32 string to fix 'Incorrect padding' error
+        missing_padding = len(clean_secret) % 8
+        if missing_padding != 0:
+            clean_secret += '=' * (8 - missing_padding)
+
         totp = pyotp.TOTP(clean_secret).now()
         data = smart_obj.generateSession(acc_details["client_id"], acc_details["pin"], totp)
         if data and data.get('status'):
@@ -351,7 +364,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
             pnl_b = get_account_pnl(smart_b) if active_positions["Phone_B"] else 0.0
 
             # ---------------------------------------------------------
-            # PHASE 1: TARGET 1 MONITORING (Strict Positive Profit >= 1500)
+            # PHASE 1: TARGET 1 MONITORING
             # ---------------------------------------------------------
             if not first_target_hit:
                 target_hit_acc = None
@@ -431,7 +444,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
                         asyncio.create_task(exit_worker_t1(smart_target, target_hit_acc, acc_key))
 
             # ---------------------------------------------------------
-            # PHASE 2: TARGET 2 MONITORING (Supports Profit or Stop-loss)
+            # PHASE 2: TARGET 2 MONITORING
             # ---------------------------------------------------------
             else:
                 rem_key = "Phone_B" if first_hit_account == "Phone A" else "Phone_A"
