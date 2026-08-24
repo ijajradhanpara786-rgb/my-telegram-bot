@@ -1,4 +1,4 @@
-python-telegram-bot
-smartapi-python
-pyotp
-requests
+import sys
+import logging
+# logzero की जगह Python के इन-बिल्ट logging का इस्तेमाल
+sys.modules['logzero'] = logging
