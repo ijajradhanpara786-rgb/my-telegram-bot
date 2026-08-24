@@ -3,17 +3,29 @@ import logging
 import asyncio
 import json
 import os
-import http.server
-import socketserver
 import threading
 import time
 from datetime import datetime
+from flask import Flask
 
 # -------------------------------------------------------------
-# 0. LOGZERO POLYFILL (Resolves missing logzero module error)
+# 1. RENDER PORT BINDING & LOGZERO FIX (Flask Web Server)
 # -------------------------------------------------------------
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 sys.modules['logzero'] = logging
+
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Trading Bot is Live and Healthy on Render!"
+
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host='0.0.0.0', port=port)
+
+# Start Flask Web Server in Background Thread for Render Port Check
+threading.Thread(target=run_flask, daemon=True).start()
 
 import pyotp
 import requests
@@ -23,17 +35,6 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes, 
     CallbackQueryHandler, MessageHandler, filters
 )
-
-# -------------------------------------------------------------
-# 1. DUMMY HTTP SERVER (For 24/7 Hosting on Render)
-# -------------------------------------------------------------
-def run_http_server():
-    port = int(os.environ.get("PORT", 8080))
-    handler = http.server.SimpleHTTPRequestHandler
-    with socketserver.TCPServer(("", port), handler) as httpd:
-        httpd.serve_forever()
-
-threading.Thread(target=run_http_server, daemon=True).start()
 
 # -------------------------------------------------------------
 # 2. CREDENTIALS & CONFIGURATION
@@ -147,7 +148,7 @@ def reset_trade_specific_flags():
     manual_mode_t2 = False
 
 # -------------------------------------------------------------
-# 6. ANGEL ONE LOGIN WITH AUTO-PADDING FIX & PNL
+# 6. ANGEL ONE LOGIN WITH AUTOMATIC TOTP PADDING FIX
 # -------------------------------------------------------------
 def login_angel_one(acc_details):
     try:
@@ -156,7 +157,7 @@ def login_angel_one(acc_details):
         # Clean TOTP Secret Key
         clean_secret = acc_details["totp_secret"].strip().replace(" ", "").upper()
         
-        # Auto-Pad Base32 string to fix 'Incorrect padding' error
+        # Automatic Base32 Dynamic Padding Fix (Fixes 'Incorrect padding' Error)
         missing_padding = len(clean_secret) % 8
         if missing_padding != 0:
             clean_secret += '=' * (8 - missing_padding)
@@ -323,7 +324,7 @@ async def smart_limit_exit_all(smart_obj, account_name):
         logging.error(f"Custom Exit Error: {str(e)}")
         return False, f"Exit Error: {str(e)}"
 
-# Helper to send Non-blocking Telegram Messages in background
+# Helper function to send Non-blocking Async Messages
 def send_telegram_async(context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None):
     async def _send():
         try:
@@ -338,7 +339,7 @@ def send_telegram_async(context: ContextTypes.DEFAULT_TYPE, text: str, reply_mar
     asyncio.create_task(_send())
 
 # -------------------------------------------------------------
-# 8. NON-BLOCKING MONITORING LOOP (0.3s Interval + 30s Anti-Spam)
+# 8. NON-BLOCKING MONITORING LOOP
 # -------------------------------------------------------------
 async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
     global is_monitoring, active_positions, current_target_1, current_target_2
@@ -363,9 +364,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
             pnl_a = get_account_pnl(smart_a) if active_positions["Phone_A"] else 0.0
             pnl_b = get_account_pnl(smart_b) if active_positions["Phone_B"] else 0.0
 
-            # ---------------------------------------------------------
             # PHASE 1: TARGET 1 MONITORING
-            # ---------------------------------------------------------
             if not first_target_hit:
                 target_hit_acc = None
                 target_pnl = 0.0
@@ -443,9 +442,7 @@ async def monitor_pnl(context: ContextTypes.DEFAULT_TYPE):
 
                         asyncio.create_task(exit_worker_t1(smart_target, target_hit_acc, acc_key))
 
-            # ---------------------------------------------------------
             # PHASE 2: TARGET 2 MONITORING
-            # ---------------------------------------------------------
             else:
                 rem_key = "Phone_B" if first_hit_account == "Phone A" else "Phone_A"
                 rem_name = "Phone B" if first_hit_account == "Phone A" else "Phone A"
@@ -718,15 +715,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ *Cancelled.*", parse_mode="Markdown")
 
 # -------------------------------------------------------------
-# 11. MAIN ENTRY
+# 11. MAIN BOT ENTRY
 # -------------------------------------------------------------
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT, message_handler))
-    print("Trading Bot is running with Non-Blocking Async Architecture...")
-    app.run_polling()
+    app_bot = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app_bot.add_handler(CommandHandler("start", start_command))
+    app_bot.add_handler(CallbackQueryHandler(button_handler))
+    app_bot.add_handler(MessageHandler(filters.TEXT, message_handler))
+    print("Trading Bot is running with Flask Port binding...")
+    app_bot.run_polling()
 
 if __name__ == "__main__":
     main()
